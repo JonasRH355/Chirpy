@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/JonasRH355/Chirpy/internal/database"
+	"github.com/JonasRH355/Chirpy/internal/auth"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/google/uuid"
@@ -30,6 +31,15 @@ type Chirp struct {
 	UserID    uuid.UUID `json:"user_id"`
 	Body      string    `json:"body"`
 }
+
+type User struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+		Hash string `json:"hashedPassword"`
+		Password string `json:"password"`
+	}
 
 func (c *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -163,12 +173,7 @@ func (c *apiConfig) chirpHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *apiConfig) addUser(w http.ResponseWriter, r *http.Request) {
-	type User struct {
-		ID        uuid.UUID `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Email     string    `json:"email"`
-	}
+	
 
 	decoder := json.NewDecoder(r.Body)
 	reqBody := User{}
@@ -179,7 +184,17 @@ func (c *apiConfig) addUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newUser, err := c.dbQueries.CreateUser(r.Context(), reqBody.Email)
+	reqBody.Hash, err = auth.HashPassWord(reqBody.Password)
+	if err != nil {
+		respondWithError(w,500,"Error on creating Hash",err)
+		return
+	}
+
+
+	newUser, err := c.dbQueries.CreateUser(r.Context(), database.CreateUserParams{
+		Email: reqBody.Email,
+		HashedPassword: reqBody.Hash,
+	})
 	if err != nil {
 		log.Printf("Error on creating user: %s", err)
 		w.WriteHeader(400)
@@ -280,6 +295,42 @@ func (c *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
 	w.Write(response)
 }
 
+func (c *apiConfig) userLogin(w http.ResponseWriter, r *http.Request) {
+	type UserReq struct {
+		Email string `json:"email"`
+		Password string `json:"password"`
+	}
+	
+	decoder := json.NewDecoder(r.Body)
+	reqBody := UserReq{}
+	err := decoder.Decode(&reqBody)
+	if err != nil {
+		respondWithError(w, 500, "Error on decoding", err)
+	}
+	
+	UserBody, err :=  c.dbQueries.GetUser(r.Context(),reqBody.Email)
+	if err != nil {
+		respondWithError(w, 500, "Error on DB query", err)
+	}
+
+	auth, err := auth.CheckPasswordHash(reqBody.Password, UserBody.HashedPassword)
+	if err != nil {
+		respondWithError(w, 500, "Error to check password", err)
+	}
+
+	if auth {
+		respondWithJSON(w, 200, User{
+			ID: UserBody.ID,
+			CreatedAt: UserBody.CreatedAt,
+			UpdatedAt: UserBody.UpdatedAt,
+			Email: UserBody.Email,
+			Hash: UserBody.HashedPassword,
+		})
+		return
+	}
+	respondWithError(w, 401, "Unauthorized", nil)
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
@@ -311,6 +362,7 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirp)
 	mux.HandleFunc("POST /api/users", apiCfg.addUser)
+	mux.HandleFunc("POST /api/login", apiCfg.userLogin)
 
 	serv := &http.Server{
 		Addr:    ":" + port,
