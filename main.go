@@ -113,6 +113,7 @@ func (c *apiConfig) PostChirp(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
 		Body  string `json:"body"`
 		UserId uuid.UUID `json:"user_id"`
+		ID uuid.UUID `json:"id"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -156,8 +157,10 @@ func (c *apiConfig) PostChirp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dat, err := json.Marshal(parameters{
+		ID: resBody.ID,
 		UserId: Id,
 		Body: resBody.Body,
+
 	})
 	if err != nil {
 		log.Printf("Error marshalling JSON: %s", err)
@@ -418,6 +421,98 @@ func (c *apiConfig) revokeToken(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w,204,nil)
 }
 
+func (c *apiConfig) authorizationUser(w http.ResponseWriter, r *http.Request) {
+	accessToken,err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w,401,"bad request",err)
+		return
+	}
+	user, err := auth.ValidateJWT(accessToken,c.secret)
+	if err != nil {
+		respondWithError(w, 401,"",err)
+		return
+	}
+
+	type UserReq struct {
+		Email string `json:"email"`
+		Password string `json:"password"` 
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	reqBody := UserReq{}
+	err = decoder.Decode(&reqBody)
+	if err != nil {
+		respondWithError(w,500,"Server Error",err)
+		return
+	}
+
+	newHashPassword, err := auth.HashPassWord(reqBody.Password)
+	if err != nil {
+		respondWithError(w,500,"Error to hash password",err)
+		return
+	}
+
+	updatedUser, err := c.dbQueries.UpdatePasswordAndEmail(r.Context(),
+	database.UpdatePasswordAndEmailParams{
+		ID: user,
+		Email: reqBody.Email,
+		HashedPassword: newHashPassword,
+	})
+	if err != nil {
+		respondWithError(w, 500, "Server error", err)
+		return
+	}
+
+	respondWithJSON(w, 200, User{
+		ID: updatedUser.ID,
+		CreatedAt: updatedUser.CreatedAt,
+		UpdatedAt: updatedUser.UpdatedAt,
+		Email: updatedUser.Email,
+		Hash: updatedUser.HashedPassword,
+	})
+
+
+}
+
+func (c *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
+	accessToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, 401, "Headers error",err)
+		return
+	}
+
+	userToken, err := auth.ValidateJWT(accessToken, c.secret)
+	if err != nil {
+		respondWithError(w, 403, "Error on validate", err)
+		return
+	}
+
+	path := r.PathValue("chirpID")
+	uuidVal, err := uuid.Parse(path)
+	if err != nil {
+		respondWithError(w,500,"",err)
+		return
+	}
+
+	chirpToDelete, err := c.dbQueries.GetChirp(r.Context(),uuidVal)
+	if err != nil {
+		respondWithError(w,404, "", err)
+		return
+	}
+
+	if chirpToDelete.UserID.UUID != userToken {
+		respondWithError(w, 403, "Not authorizated", nil)
+		return
+	}
+
+	err = c.dbQueries.DeleteChirp(r.Context(),chirpToDelete.ID)
+	if err != nil {
+		respondWithError(w, 500, "Error on delete chirp",err)
+	}
+
+	respondWithJSON(w, 204, nil)
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
@@ -451,6 +546,8 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirp)
 	mux.HandleFunc("POST /api/users", apiCfg.addUser)
+	mux.HandleFunc("PUT /api/users", apiCfg.authorizationUser)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirp)
 	mux.HandleFunc("POST /api/login", apiCfg.userLogin)
 	mux.HandleFunc("POST /api/refresh",apiCfg.refreshToken)
 	mux.HandleFunc("POST /api/revoke", apiCfg.revokeToken)
