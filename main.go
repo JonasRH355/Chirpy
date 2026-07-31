@@ -22,6 +22,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      database.Queries
 	platform       string
+	secret string
 }
 
 type Chirp struct {
@@ -39,6 +40,7 @@ type User struct {
 		Email     string    `json:"email"`
 		Hash string `json:"hashedPassword"`
 		Password string `json:"password"`
+		Token string `json:"token"`
 	}
 
 func (c *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -106,10 +108,9 @@ func removeBadWords(sentence string) string {
 	return strings.Join(newSentence, " ")
 }
 
-func (c *apiConfig) chirpHandler(w http.ResponseWriter, r *http.Request) {
-	sttsCode := 200
+func (c *apiConfig) PostChirp(w http.ResponseWriter, r *http.Request) {
+	sttsCode := 201
 	type parameters struct {
-		Id uuid.UUID `json:"id"`
 		Body  string `json:"body"`
 		UserId uuid.UUID `json:"user_id"`
 	}
@@ -123,40 +124,40 @@ func (c *apiConfig) chirpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Println("Decoded request")
-
-	newChirp := database.CreateChirpParams{}
-	newChirp.UserID.UUID = params.UserId
-	newChirp.UserID.Valid = true
-
-	newChirp.Body = removeBadWords(params.Body)
-
-	if len(newChirp.Body) <= 140 {
-		sttsCode = 201
-	} else {
-		sttsCode = 400
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(sttsCode)
-	}
-	
-	fmt.Printf("%v Removed bad words:\nBefore: %v\nAfter: %v\n",sttsCode,params.Body,newChirp.Body)
-
-	resBody,err := c.dbQueries.CreateChirp(r.Context(),newChirp)
+	JWTToken, err := auth.GetBearerToken(r.Header)
 	if err != nil {
-		sttsCode = 400
-		w.Header().Set("Content-Type", "application/json")
-		log.Println(err)
-		w.WriteHeader(sttsCode)
+		respondWithError(w, 500, "Error to get JWT Token", err)
 		return
 	}
 
-	fmt.Printf("Created new chirp: %v \n", resBody)
+	Id, err := auth.ValidateJWT(JWTToken,c.secret)
+	if err != nil {
+		respondWithError(w, 401, "Error on validate user",err)
+		return
+	}
 
+	newChirp := database.CreateChirpParams{
+		Body: removeBadWords(params.Body),
+		UserID: uuid.NullUUID{
+			UUID: Id,
+			Valid: true, 
+		},
+	}
+
+	if len(newChirp.Body) > 140 {
+		respondWithError(w,400,"Too much words",nil)
+		return
+	}
+
+	resBody,err := c.dbQueries.CreateChirp(r.Context(),newChirp)
+	if err != nil {
+		respondWithError(w,400,"",err)
+		return
+	}
 
 	dat, err := json.Marshal(parameters{
-		Id: resBody.ID,
+		UserId: Id,
 		Body: resBody.Body,
-		UserId: resBody.UserID.UUID,
 	})
 	if err != nil {
 		log.Printf("Error marshalling JSON: %s", err)
@@ -298,43 +299,130 @@ func (c *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
 func (c *apiConfig) userLogin(w http.ResponseWriter, r *http.Request) {
 	type UserReq struct {
 		Email string `json:"email"`
-		Password string `json:"password"`
+		Password string `json:"password"` 
+	}
+
+	type UserRes struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+		Token string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	
+	// Geting the request informations
 	decoder := json.NewDecoder(r.Body)
 	reqBody := UserReq{}
 	err := decoder.Decode(&reqBody)
 	if err != nil {
 		respondWithError(w, 500, "Error on decoding", err)
+		return
 	}
-	
+
+	// Geting user's informations by email 
 	UserBody, err :=  c.dbQueries.GetUser(r.Context(),reqBody.Email)
 	if err != nil {
 		respondWithError(w, 500, "Error on DB query", err)
+		return
 	}
 
-	auth, err := auth.CheckPasswordHash(reqBody.Password, UserBody.HashedPassword)
+	// Checking if the password is correct
+	authV, err := auth.CheckPasswordHash(reqBody.Password, UserBody.HashedPassword)
 	if err != nil {
 		respondWithError(w, 500, "Error to check password", err)
+		return
 	}
 
-	if auth {
-		respondWithJSON(w, 200, User{
+	if !authV {
+		respondWithError(w,400,"Incorrect password",nil)
+		return
+	}
+
+	// deffining expiration time for JWT
+	expTimeJWT := 3600
+
+	// creating the JWT token
+	token, err := auth.MakeJWT(UserBody.ID, c.secret, time.Duration(expTimeJWT)*time.Second)
+	if err != nil {
+		respondWithError(w, 500, "Error to Make JWT token",err)
+		return
+	}
+
+	// Deffining expiration time for refresh
+	// expTRefresh := 60
+	newRToken := auth.MakeRefreshToken()
+
+	c.dbQueries.NewToken(r.Context(),database.NewTokenParams{
+		Token: newRToken,
+		UserID: uuid.NullUUID{
+			UUID: UserBody.ID,
+			Valid: true,
+		},
+	})
+
+	// Response
+	if authV {
+		respondWithJSON(w, 200, UserRes{
 			ID: UserBody.ID,
 			CreatedAt: UserBody.CreatedAt,
 			UpdatedAt: UserBody.UpdatedAt,
 			Email: UserBody.Email,
-			Hash: UserBody.HashedPassword,
+			Token: token,
+			RefreshToken: newRToken,
 		})
 		return
 	}
 	respondWithError(w, 401, "Unauthorized", nil)
 }
 
+func (c *apiConfig) refreshToken(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w,400,"Bad request", err)
+		return
+	}
+
+	val, err := c.dbQueries.GetUserFromRefreshToken(r.Context(),refreshToken)
+	if err != nil || val.RevokedAt.Valid {
+		respondWithError(w, 401, "...", err)
+		return
+	}
+
+	newAccesstoken, err :=auth.MakeJWT(val.UserID.UUID,c.secret,time.Hour)
+	if err != nil {
+		respondWithError(w,500,"error to get the new JWS", err)
+	}
+
+	type response struct{
+		Token string `json:"token"`
+	}
+	respondWithJSON(w,200,response{Token: newAccesstoken})
+
+
+
+}
+
+func (c *apiConfig) revokeToken(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w,400,"Bad request", err)
+		return
+	}
+
+	if c.dbQueries.UpdateRefreshToken(r.Context(),refreshToken) != nil {
+		respondWithError(w,401,"...", err)
+		return
+	}
+
+	respondWithJSON(w,204,nil)
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	dbPLATFORM := os.Getenv("PLATFORM")
+	dbSecret := os.Getenv("SECRET")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
@@ -347,6 +435,7 @@ func main() {
 	apiCfg := apiConfig{
 		dbQueries: *dbQueries,
 		platform:  dbPLATFORM,
+		secret: dbSecret,
 	}
 	apiCfg.fileserverHits.Store(0)
 
@@ -358,11 +447,13 @@ func main() {
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerHits)
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
 	mux.HandleFunc("GET /api/healthz", handler)
-	mux.HandleFunc("POST /api/chirps", apiCfg.chirpHandler)
+	mux.HandleFunc("POST /api/chirps", apiCfg.PostChirp)
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirp)
 	mux.HandleFunc("POST /api/users", apiCfg.addUser)
 	mux.HandleFunc("POST /api/login", apiCfg.userLogin)
+	mux.HandleFunc("POST /api/refresh",apiCfg.refreshToken)
+	mux.HandleFunc("POST /api/revoke", apiCfg.revokeToken)
 
 	serv := &http.Server{
 		Addr:    ":" + port,
