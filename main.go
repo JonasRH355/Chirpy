@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,11 +12,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/JonasRH355/Chirpy/internal/database"
 	"github.com/JonasRH355/Chirpy/internal/auth"
+	"github.com/JonasRH355/Chirpy/internal/database"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
-	"github.com/google/uuid"
 )
 
 type apiConfig struct {
@@ -226,13 +227,42 @@ func (c *apiConfig) addUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *apiConfig) getChirps(w http.ResponseWriter, r *http.Request){
-	chirps, err := c.dbQueries.GetChirps(r.Context())
-	if err != nil {
-		w.WriteHeader(500)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("Error on DB"))
+	author := r.URL.Query().Get("author_id")
+	var chirps []database.Chirp
+	var err error
+
+	if author != "" {
+		chirps, err = c.dbQueries.GetChirpsByAuthor(r.Context(),uuid.NullUUID{
+			UUID: uuid.MustParse(author),
+			Valid: true,
+		})
+		if err != nil {
+			respondWithError(w,500,"Error on DB",err)
+			return
+		}
+	} else {
+		chirps, err = c.dbQueries.GetChirps(r.Context())
+		if err != nil {
+			respondWithError(w,500,"Error on DB",err)
+			return
+		}
 	}
 
+	sortField := r.URL.Query().Get("sort")
+	if sortField == "desc" {
+		sort.Slice(chirps,func(i, j int) bool {
+			result := chirps[i].CreatedAt.Compare(chirps[j].CreatedAt) 
+			if result > 0 {return true}
+			return false
+		})
+	} else {
+		sort.Slice(chirps,func(i, j int) bool {
+			result := chirps[i].CreatedAt.Compare(chirps[j].CreatedAt) 
+			if result > 0 {return false}
+			return true
+		})
+	}
+	
 	respBody := []Chirp{}
 	for _,i := range chirps {
 		respBody = append(respBody, Chirp{
