@@ -166,5 +166,3 @@ The course covers:
 ## 📜 Certificate
 
 Completed **Learn HTTP Servers in Go** on Boot.dev.
-
-```
