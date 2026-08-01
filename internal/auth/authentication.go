@@ -97,3 +97,13 @@ func MakeRefreshToken() string {
 	rand.Read(hax)
 	return hex.EncodeToString(hax)
 }
+
+func GetPIKey(headers http.Header) (string, error) {
+	val := headers.Get("Authorization")
+	if val == "" {
+		return "", fmt.Errorf("Token doesnt exist")
+	}
+	res := strings.Split(val, " ")
+	
+	return res[1], nil
+}
